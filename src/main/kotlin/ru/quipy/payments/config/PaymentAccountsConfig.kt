@@ -3,6 +3,7 @@ package ru.quipy.payments.config
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import org.slf4j.LoggerFactory
 import org.springframework.context.annotation.Bean
 import org.springframework.context.annotation.Configuration
 import ru.quipy.core.EventSourcingService
@@ -19,8 +20,11 @@ import java.util.*
 @Configuration
 class PaymentAccountsConfig {
     companion object {
+        private val logger = LoggerFactory.getLogger(PaymentAccountsConfig::class.java)
         private val PAYMENT_PROVIDER_HOST_PORT: String = "localhost:1234"
-        private val javaClient = HttpClient.newBuilder().build()
+        private val javaClient = HttpClient.newBuilder()
+            .connectTimeout(Duration.ofSeconds(5))
+            .build()
         private val mapper = ObjectMapper().registerKotlinModule().registerModules(JavaTimeModule())
     }
 
@@ -28,22 +32,41 @@ class PaymentAccountsConfig {
 
     @Bean
     fun accountAdapters(paymentService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>): List<PaymentExternalSystemAdapter> {
-        val request = HttpRequest.newBuilder()
-            .uri(URI("http://${PAYMENT_PROVIDER_HOST_PORT}/external/accounts?serviceName=onlineStore"))
-            .GET()
-            .build()
+        return try {
+            val request = HttpRequest.newBuilder()
+                .uri(URI("http://${PAYMENT_PROVIDER_HOST_PORT}/external/accounts?serviceName=onlineStore"))
+                .GET()
+                .build()
 
-        val resp = javaClient.send(request, HttpResponse.BodyHandlers.ofString())
+            val resp = javaClient.send(request, HttpResponse.BodyHandlers.ofString())
 
-        println("\nPayment accounts list:")
-        return mapper.readValue<List<PaymentAccountProperties>>(
-            resp.body(),
-            mapper.typeFactory.constructCollectionType(List::class.java, PaymentAccountProperties::class.java)
-        )
-            .filter {
-                it.accountName in allowedAccounts
-            }.onEach(::println)
-            .map { PaymentExternalSystemAdapterImpl(it, paymentService) }
+            logger.info("\nPayment accounts list:")
+            mapper.readValue<List<PaymentAccountProperties>>(
+                resp.body(),
+                mapper.typeFactory.constructCollectionType(List::class.java, PaymentAccountProperties::class.java)
+            )
+                .filter {
+                    it.accountName in allowedAccounts
+                }.onEach { logger.info(it.toString()) }
+                .map { PaymentExternalSystemAdapterImpl(it, paymentService) }
+        } catch (e: Exception) {
+            logger.warn("Failed to fetch accounts from external service, using default configuration", e)
+            // Создаем дефолтную конфигурацию для acc-3
+            listOf(
+                PaymentExternalSystemAdapterImpl(
+                    PaymentAccountProperties(
+                        serviceName = "onlineStore",
+                        accountName = "acc-3",
+                        parallelRequests = 30,
+                        rateLimitPerSec = 10,
+                        price = 30,
+                        averageProcessingTime = Duration.ofSeconds(1),
+                        enabled = true
+                    ),
+                    paymentService
+                )
+            )
+        }
     }
 
     @Bean
