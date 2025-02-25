@@ -8,12 +8,13 @@ import org.springframework.context.annotation.Configuration
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import ru.quipy.payments.logic.*
+import ru.quipy.common.utils.LeakingBucketRateLimiter
 import java.net.URI
 import java.net.http.HttpClient
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
+import java.time.Duration
 import java.util.*
-
 
 @Configuration
 class PaymentAccountsConfig {
@@ -23,12 +24,12 @@ class PaymentAccountsConfig {
         private val mapper = ObjectMapper().registerKotlinModule().registerModules(JavaTimeModule())
     }
 
-    private val allowedAccounts = setOf("acc-5")
+    private val allowedAccounts = setOf("acc-3")
 
     @Bean
     fun accountAdapters(paymentService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>): List<PaymentExternalSystemAdapter> {
         val request = HttpRequest.newBuilder()
-            .uri(URI("http://${PAYMENT_PROVIDER_HOST_PORT}/external/accounts?serviceName=onlineStore")) // todo sukhoa service name
+            .uri(URI("http://${PAYMENT_PROVIDER_HOST_PORT}/external/accounts?serviceName=onlineStore"))
             .GET()
             .build()
 
@@ -43,5 +44,14 @@ class PaymentAccountsConfig {
                 it.accountName in allowedAccounts
             }.onEach(::println)
             .map { PaymentExternalSystemAdapterImpl(it, paymentService) }
+    }
+
+    @Bean
+    fun rateLimiter(): LeakingBucketRateLimiter {
+        return LeakingBucketRateLimiter(
+            rate = 10,  // 10 запросов в секунду
+            window = Duration.ofSeconds(1),
+            bucketSize = 30  // Максимум параллельных запросов
+        )
     }
 }
