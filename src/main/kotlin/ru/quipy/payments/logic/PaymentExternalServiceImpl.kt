@@ -13,6 +13,9 @@ import ru.quipy.payments.api.PaymentAggregate
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
+import java.util.concurrent.Executors
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 
 
@@ -35,6 +38,7 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
     private var waitTime: Long = 1000
+    private val threadCount = 50 // ratePerSecond / (1 / averageProcessingTime) = 100 / (1 / 0.5)
 
     private val httpClient = OkHttpClient.Builder()
         .callTimeout((requestAverageProcessingTime.toMillis() * 1.5).toLong(), TimeUnit.MILLISECONDS)
@@ -42,6 +46,14 @@ class PaymentExternalSystemAdapterImpl(
 
     private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong() - 1, Duration.ofSeconds(1))
     private val window = OngoingWindow(parallelRequests)
+    private val pool = ThreadPoolExecutor(
+        threadCount,
+        threadCount,
+        //20000.toLong(),
+        0.toLong(),
+        TimeUnit.MILLISECONDS,
+        LinkedBlockingQueue(5000)
+    )
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
@@ -56,67 +68,80 @@ class PaymentExternalSystemAdapterImpl(
         }
         window.acquire()
 
-        try {
-            val req = Request.Builder().run {
-                url("http://localhost:1234/external/process?serviceName=${serviceName}&accountName=${accountName}&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
-                post(emptyBody)
-            }.build()
+        pool.submit {
+            try {
+                val req = Request.Builder().run {
+                    url("http://localhost:1234/external/process?serviceName=${serviceName}&accountName=${accountName}&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
+                    post(emptyBody)
+                }.build()
 
-            // пробуем отправить платеж пока не закончится время
-            while (now() < deadline) {
-                try {
-                    rateLimiter.tickBlocking()
-                    if (now() + requestAverageProcessingTime.toMillis() >= deadline) {
-                        logger.warn("[$accountName] No time left for: $paymentId")
+                // пробуем отправить платеж пока не закончится время
+                while (now() < deadline) {
+                    try {
+                        rateLimiter.tickBlocking()
+                        if (now() + requestAverageProcessingTime.toMillis() >= deadline) {
+                            logger.warn("[$accountName] No time left for: $paymentId")
+                            break
+                        }
+
+                        val resp = httpClient.newCall(req).execute()
+                        resp.use { response ->
+                            if (response.isSuccessful) {
+                                val responseString = response.body?.string() ?: ""
+                                val result = try {
+                                    mapper.readValue(responseString, ExternalSysResponse::class.java)
+                                } catch (e: Exception) {
+                                    ExternalSysResponse(
+                                        transactionId.toString(),
+                                        paymentId.toString(),
+                                        false,
+                                        e.message
+                                    )
+                                }
+                                logger.info("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, result: ${result.result}, message: ${result.message}")
+                                paymentESService.update(paymentId) {
+                                    it.logProcessing(result.result, now(), transactionId, reason = result.message)
+                                }
+                                return@submit
+                            } else if (response.code == 429 || response.code == 503) {
+                                val retryHeader = response.headers["Retry-After"]
+                                if (!retryHeader.isNullOrEmpty()) {
+                                    waitTime = retryHeader.toLong() * 1000
+                                }
+                            } else {
+                                logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId, code: ${response.code}")
+                                paymentESService.update(paymentId) {
+                                    it.logProcessing(false, now(), transactionId, reason = "HTTP ${response.code}")
+                                }
+                                return@submit
+                            }
+                        }
+                    } catch (e: SocketTimeoutException) {
+                        logger.error("[$accountName] Timeout: tx=$transactionId, payment=$paymentId", e)
+                    } catch (e: Exception) {
+                        logger.error("[$accountName] Unexpected error: tx=$transactionId, payment=$paymentId", e)
+                    }
+
+                    if (now() + waitTime >= deadline) {
                         break
                     }
 
-                    val resp = httpClient.newCall(req).execute()
-                    resp.use { response ->
-                        if (response.isSuccessful) {
-                            val responseString = response.body?.string() ?: ""
-                            val result = try {
-                                mapper.readValue(responseString, ExternalSysResponse::class.java)
-                            } catch (e: Exception) {
-                                ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
-                            }
-                            logger.info("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, result: ${result.result}, message: ${result.message}")
-                            paymentESService.update(paymentId) {
-                                it.logProcessing(result.result, now(), transactionId, reason = result.message)
-                            }
-                            return
-                        } else if (response.code == 429 || response.code == 503) {
-                            val retryHeader = response.headers["Retry-After"]
-                            if (!retryHeader.isNullOrEmpty()) {
-                                waitTime = retryHeader.toLong() * 1000
-                            }
-                        } else {
-                            logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId, code: ${response.code}")
-                            paymentESService.update(paymentId) {
-                                it.logProcessing(false, now(), transactionId, reason = "HTTP ${response.code}")
-                            }
-                            return
-                        }
-                    }
-                } catch (e: SocketTimeoutException) {
-                    logger.error("[$accountName] Timeout: tx=$transactionId, payment=$paymentId", e)
-                } catch (e: Exception) {
-                    logger.error("[$accountName] Unexpected error: tx=$transactionId, payment=$paymentId", e)
+                    Thread.sleep(waitTime)
                 }
-
-                if (now() + waitTime >= deadline) {
-                    break
+                logger.error("[$accountName] Can't squeeze more retries into the deadline for txId: $transactionId, payment: $paymentId")
+                paymentESService.update(paymentId) {
+                    it.logProcessing(
+                        false,
+                        now(),
+                        transactionId,
+                        reason = "Can't squeeze more retries into the deadline"
+                    )
                 }
-
-                Thread.sleep(waitTime)
+            } finally {
+                window.release()
             }
-            logger.error("[$accountName] Can't squeeze more retries into the deadline for txId: $transactionId, payment: $paymentId")
-            paymentESService.update(paymentId) {
-                it.logProcessing(false, now(), transactionId, reason = "Can't squeeze more retries into the deadline")
-            }
-        } finally {
-            window.release()
         }
+
     }
 
     override fun price() = properties.price
