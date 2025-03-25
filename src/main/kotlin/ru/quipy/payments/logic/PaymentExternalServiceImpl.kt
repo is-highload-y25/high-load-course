@@ -6,6 +6,8 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
 import org.slf4j.LoggerFactory
+import ru.quipy.common.utils.NonBlockingOngoingWindow
+import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import java.net.SocketTimeoutException
@@ -33,6 +35,10 @@ class PaymentExternalSystemAdapterImpl(
     private val parallelRequests = properties.parallelRequests
 
     private val client = OkHttpClient.Builder().build()
+    private val ongoingWindow = NonBlockingOngoingWindow(parallelRequests)
+    private val rateLimiter = SlidingWindowRateLimiter(
+        rateLimitPerSec.toLong(), Duration.ofSeconds(1L)
+    )
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
@@ -52,6 +58,24 @@ class PaymentExternalSystemAdapterImpl(
         }.build()
 
         try {
+            while(ongoingWindow.putIntoWindow() !is NonBlockingOngoingWindow.WindowResponse.Success) {
+                if (now() + requestAverageProcessingTime.toMillis() >= deadline) {
+                    paymentESService.update(paymentId) {
+                        it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
+                    }
+                    return
+                }
+            }
+
+            while(!rateLimiter.tick()) {
+                if (now() + requestAverageProcessingTime.toMillis() >= deadline) {
+                    paymentESService.update(paymentId) {
+                        it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
+                    }
+                    return
+                }
+            }
+
             client.newCall(request).execute().use { response ->
                 val body = try {
                     mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
@@ -85,6 +109,8 @@ class PaymentExternalSystemAdapterImpl(
                     }
                 }
             }
+        } finally {
+            ongoingWindow.releaseWindow()
         }
     }
 
